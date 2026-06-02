@@ -1,0 +1,123 @@
+# =============================================================================
+# HomeLab Stack — CI Docker Compose Validation
+# Validates all docker-compose files in CI without starting full stacks
+# Usage:
+#   docker compose -f tests/ci/docker-compose.test.yml run sut
+#   # Or run locally:
+#   ./tests/ci/docker-compose.test.sh
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # CI Validation Service — runs all compose file checks
+  # ---------------------------------------------------------------------------
+  sut:
+    image: alpine:3.19
+    container_name: homelab-ci-validator
+    restart: "no"
+    networks:
+      - test
+    volumes:
+      # Mount the project root as read-only
+      - ../../.:/project:ro
+      # Mount docker socket for validation
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - TZ=UTC
+      # Validate only (don't pull large images)
+      - VALIDATE_COMPOSE_ONLY=1
+      - COMPOSE_FILES_DIR=/project/stacks
+    command: |
+      sh -c '
+        set -euo pipefail
+
+        echo "=== HomeLab Stack CI Validation ==="
+        echo "Project: /project"
+        echo ""
+
+        # Check prerequisites
+        command -v docker >/dev/null 2>&1 || { echo "docker not found"; exit 1; }
+        command -v yq >/dev/null 2>&1 || { echo "yq not found, installing..."; apk add --no-cache yq; }
+
+        # Validate each compose file
+        COMPOSE_DIR="/project/stacks"
+        VALID=0
+        INVALID=0
+
+        for compose_file in $(find "$COMPOSE_DIR" -name "docker-compose.yml" 2>/dev/null | sort); do
+          dir=$(dirname "$compose_file")
+          name=$(basename "$dir")
+
+          echo "--- Checking: $name ---"
+          echo "  File: $compose_file"
+
+          # Check file is valid YAML
+          if ! yq eval '.' "$compose_file" >/dev/null 2>&1; then
+            echo "  ERROR: Invalid YAML"
+            ((INVALID++))
+            continue
+          fi
+          echo "  OK: Valid YAML"
+
+          # Check required top-level keys
+          for key in services networks volumes; do
+            if yq eval "has(\"$key\")" "$compose_file" >/dev/null 2>&1; then
+              count=$(yq eval ".$key | length" "$compose_file")
+              echo "  OK: $key ($count entries)"
+            fi
+          done
+
+          # Check each service has an image or build
+          service_count=$(yq eval '.services | length' "$compose_file" 2>/dev/null || echo 0)
+          echo "  Services: $service_count"
+
+          for service in $(yq eval '.services | keys | .[]' "$compose_file" 2>/dev/null); do
+            has_image=$(yq eval ".services.\"$service\" | has(\"image\")" "$compose_file")
+            has_build=$(yq eval ".services.\"$service\" | has(\"build\")" "$compose_file")
+
+            if [[ "$has_image" == "true" ]] || [[ "$has_build" == "true" ]]; then
+              echo "    - $service: OK (image or build defined)"
+            else
+              echo "    - $service: WARN (no image or build)"
+            fi
+
+            # Check for healthcheck if service has ports exposed
+            has_ports=$(yq eval ".services.\"$service\" | has(\"ports\")" "$compose_file")
+            has_healthcheck=$(yq eval ".services.\"$service\" | has(\"healthcheck\")" "$compose_file")
+            if [[ "$has_ports" == "true" ]] && [[ "$has_healthcheck" != "true" ]]; then
+              echo "    - $service: WARN (has ports but no healthcheck)"
+            fi
+          done
+
+          # Validate docker-compose syntax (dry run)
+          # Note: We only do syntax check, not full validation (which would pull images)
+          if docker compose -f "$compose_file" config >/dev/null 2>&1; then
+            echo "  OK: docker compose config valid"
+            ((VALID++))
+          else
+            echo "  ERROR: docker compose config failed"
+            docker compose -f "$compose_file" config 2>&1 | head -5
+            ((INVALID++))
+          fi
+
+          echo ""
+        done
+
+        echo "=== Summary ==="
+        echo "Valid:   $VALID"
+        echo "Invalid: $INVALID"
+        echo ""
+
+        if [[ $INVALID -gt 0 ]]; then
+          echo "VALIDATION FAILED"
+          exit 1
+        else
+          echo "ALL CHECKS PASSED"
+          exit 0
+        fi
+      '
+
+networks:
+  test:
+    name: homelab-ci-test
+    driver: bridge
